@@ -1,0 +1,71 @@
+name: hazop-safeguard-coverage
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hazop-safeguard-coverage-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hazop_coverage}
+      POSTGRES_USER: ${POSTGRES_USER:-hazop_coverage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hazop_coverage_dev}
+    ports:
+      - "${DB_PORT:-57531}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hazop_coverage} -d ${POSTGRES_DB:-hazop_coverage}"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  backend:
+    build:
+      context: ./backend
+    container_name: hazop-safeguard-coverage-backend
+    restart: unless-stopped
+    environment:
+      GIN_MODE: ${GIN_MODE:-release}
+      PORT: "8080"
+      DB_DRIVER: postgres
+      DB_DSN: ${DB_DSN:-host=db user=hazop_coverage password=hazop_coverage_dev dbname=hazop_coverage port=5432 sslmode=disable TimeZone=Asia/Shanghai}
+      JWT_SECRET: ${JWT_SECRET:-change-this-hazop-coverage-secret-at-least-32-bytes}
+      JWT_EXPIRY: ${JWT_EXPIRY:-8h}
+      LOGIN_LIMIT_PER_MINUTE: ${LOGIN_LIMIT_PER_MINUTE:-30}
+      RUN_LIMIT_PER_MINUTE: ${RUN_LIMIT_PER_MINUTE:-60}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      VERIFICATION_GRACE_DAYS: ${VERIFICATION_GRACE_DAYS:-0}
+    ports:
+      - "${BACKEND_PORT:-19531}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: hazop-safeguard-coverage-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-18531}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  postgres_data:
+    name: hazop-safeguard-coverage-postgres-data

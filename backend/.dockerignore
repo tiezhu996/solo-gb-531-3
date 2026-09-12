@@ -1,0 +1,7 @@
+.git
+bin
+coverage
+*.log
+*.db
+*.db-shm
+*.db-wal

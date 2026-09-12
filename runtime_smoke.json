@@ -1,0 +1,14 @@
+{
+  "mode": "service",
+  "start": "go run ./cmd/server",
+  "workdir": "backend",
+  "env": {
+    "PORT": "20531",
+    "DB_DRIVER": "sqlite",
+    "DB_DSN": "file:runtime-smoke?mode=memory&cache=shared",
+    "JWT_SECRET": "runtime-smoke-only-change-me"
+  },
+  "ready_url": "http://127.0.0.1:20531/healthz",
+  "ready_status": [200],
+  "startup_timeout": 30
+}
