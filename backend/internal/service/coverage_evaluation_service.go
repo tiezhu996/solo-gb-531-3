@@ -383,21 +383,29 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 	}
 	response := dto.NewCoverageEvaluationResponse(evaluation)
 	if !json.Valid([]byte(evaluation.InputSnapshot)) {
-		return dto.CoverageEvidencePackResponse{}, util.NewError(http.StatusUnprocessableEntity, util.CodeValidation, "stored input snapshot is unreadable; evidence pack cannot be exported")
+		return dto.CoverageEvidencePackResponse{}, util.NewError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: frozen input snapshot is not valid immutable JSON")
 	}
 	var explanation dto.EvaluationExplanation
 	if err := json.Unmarshal([]byte(evaluation.Explanation), &explanation); err != nil {
-		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "stored scoring explanation is unreadable; evidence pack cannot be exported", err)
+		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: scoring steps explanation is not valid JSON", err)
 	}
-	scoreSteps, uncovered, deduplicated := response.Explanation.ScoreSteps, response.UncoveredPaths, response.DeduplicatedSafeguards
+	var uncovered []dto.CoveragePathResponse
+	if err := json.Unmarshal([]byte(evaluation.UncoveredPaths), &uncovered); err != nil {
+		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: uncovered paths record is not valid JSON", err)
+	}
+	var deduplicated []dto.DeduplicatedSafeguardResponse
+	if err := json.Unmarshal([]byte(evaluation.DeduplicatedSafeguards), &deduplicated); err != nil {
+		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: independence dedup record is not valid JSON", err)
+	}
+	scoreSteps, uncoveredPaths, deduplicatedSafeguards := response.Explanation.ScoreSteps, response.UncoveredPaths, response.DeduplicatedSafeguards
 	if scoreSteps == nil {
 		scoreSteps = []dto.ScoreStepResponse{}
 	}
-	if uncovered == nil {
-		uncovered = []dto.CoveragePathResponse{}
+	if uncoveredPaths == nil {
+		uncoveredPaths = []dto.CoveragePathResponse{}
 	}
-	if deduplicated == nil {
-		deduplicated = []dto.DeduplicatedSafeguardResponse{}
+	if deduplicatedSafeguards == nil {
+		deduplicatedSafeguards = []dto.DeduplicatedSafeguardResponse{}
 	}
 	return dto.CoverageEvidencePackResponse{
 		PackVersion: evidencePackVersion, ExportedAt: s.now(),

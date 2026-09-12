@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,20 +207,39 @@ func TestExportEvidencePackErrors(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-	corrupt := model.CoverageEvaluation{
-		ScenarioID: scenario.ID, AlgorithmVersion: algorithm.Version,
-		InputSnapshot: "{not-json", InputHash: "broken",
-		UncoveredPaths: "[]", DeduplicatedSafeguards: "[]", Explanation: "{}",
-		RiskRankBefore: "high", RiskRankAfter: "high", EvaluationState: "failed",
-		EvaluatedBy: 7, EvaluatedByName: "author", EvaluatedAt: now,
-		CreatedAt: now, UpdatedAt: now, IdempotencyKey: "evidence-key-corrupt-001",
+	validBase := func(key string) model.CoverageEvaluation {
+		return model.CoverageEvaluation{
+			ScenarioID: scenario.ID, AlgorithmVersion: algorithm.Version,
+			InputSnapshot: `{"algorithm_version":"hazop-cover-v1.0.0"}`, InputHash: "broken",
+			UncoveredPaths: "[]", DeduplicatedSafeguards: "[]", Explanation: "{}",
+			RiskRankBefore: "high", RiskRankAfter: "high", EvaluationState: "failed",
+			EvaluatedBy: 7, EvaluatedByName: "author", EvaluatedAt: now,
+			CreatedAt: now, UpdatedAt: now, IdempotencyKey: key,
+		}
 	}
-	if err := repo.Create(context.Background(), &corrupt); err != nil {
-		t.Fatalf("create corrupt evaluation: %v", err)
+	corruptCases := []struct {
+		name      string
+		key       string
+		mutate    func(*model.CoverageEvaluation)
+		wantError string
+	}{
+		{name: "snapshot", key: "evidence-corrupt-snapshot-1", mutate: func(e *model.CoverageEvaluation) { e.InputSnapshot = "{not-json" }, wantError: "frozen input snapshot"},
+		{name: "explanation", key: "evidence-corrupt-explain-01", mutate: func(e *model.CoverageEvaluation) { e.Explanation = "{not-json" }, wantError: "scoring steps explanation"},
+		{name: "uncovered", key: "evidence-corrupt-paths-001", mutate: func(e *model.CoverageEvaluation) { e.UncoveredPaths = "{not-json" }, wantError: "uncovered paths record"},
+		{name: "dedup", key: "evidence-corrupt-dedup-001", mutate: func(e *model.CoverageEvaluation) { e.DeduplicatedSafeguards = "{not-json" }, wantError: "independence dedup record"},
 	}
-	_, err = svc.ExportEvidencePack(context.Background(), corrupt.ID)
-	var invalid *util.AppError
-	if !errors.As(err, &invalid) || invalid.Status != 422 {
-		t.Fatalf("unreadable snapshot must surface a clear 422 export failure, got %v", err)
+	for _, tc := range corruptCases {
+		t.Run(tc.name, func(t *testing.T) {
+			evaluation := validBase(tc.key)
+			tc.mutate(&evaluation)
+			if err := repo.Create(context.Background(), &evaluation); err != nil {
+				t.Fatalf("create corrupt evaluation: %v", err)
+			}
+			_, err = svc.ExportEvidencePack(context.Background(), evaluation.ID)
+			var invalid *util.AppError
+			if !errors.As(err, &invalid) || invalid.Status != 422 || !strings.Contains(invalid.Message, tc.wantError) {
+				t.Fatalf("corrupt %s must surface a 422 naming %q, got %v", tc.name, tc.wantError, err)
+			}
+		})
 	}
 }
