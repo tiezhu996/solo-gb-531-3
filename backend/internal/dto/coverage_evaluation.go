@@ -85,6 +85,38 @@ type EvaluationComparisonResponse struct {
 	RiskRankChanged    bool    `json:"risk_rank_changed"`
 	InputChanged       bool    `json:"input_changed"`
 }
+
+type EvidencePackState struct {
+	Code            string     `json:"code"`
+	Label           string     `json:"label"`
+	ReadableSummary string     `json:"readable_summary"`
+	FailureReason   string     `json:"failure_reason,omitempty"`
+	ConfirmedBy     *uint      `json:"confirmed_by,omitempty"`
+	ConfirmedAt     *time.Time `json:"confirmed_at,omitempty"`
+}
+
+type CoverageEvidencePackResponse struct {
+	PackVersion            string                          `json:"pack_version"`
+	ExportedAt             time.Time                       `json:"exported_at"`
+	EvaluationID           uint                            `json:"evaluation_id"`
+	ScenarioID             uint                            `json:"scenario_id"`
+	AlgorithmVersion       string                          `json:"algorithm_version"`
+	IdempotencyKey         string                          `json:"idempotency_key"`
+	InputHash              string                          `json:"input_hash"`
+	InputSnapshot          json.RawMessage                 `json:"input_snapshot"`
+	CoverageScore          float64                         `json:"coverage_score"`
+	ScoreSteps             []ScoreStepResponse             `json:"score_steps"`
+	UncoveredPaths         []CoveragePathResponse          `json:"uncovered_paths"`
+	DeduplicatedSafeguards []DeduplicatedSafeguardResponse `json:"deduplicated_safeguards"`
+	RiskRankBefore         string                          `json:"risk_rank_before"`
+	RiskRankAfter          string                          `json:"risk_rank_after"`
+	State                  EvidencePackState               `json:"state"`
+	EvaluatedBy            uint                            `json:"evaluated_by"`
+	EvaluatedByName        string                          `json:"evaluated_by_name"`
+	EvaluatedAt            time.Time                       `json:"evaluated_at"`
+	DurationMilliseconds   int64                           `json:"duration_milliseconds"`
+	BoundaryNote           string                          `json:"boundary_note"`
+}
 func NewCoverageEvaluationResponse(e model.CoverageEvaluation) CoverageEvaluationResponse {
 	response := CoverageEvaluationResponse{
 		ID: e.ID, ScenarioID: e.ScenarioID, AlgorithmVersion: e.AlgorithmVersion,

@@ -69,7 +69,42 @@ export interface CoverageEvaluation {
   input_hash?: string
   deduplicated_safeguards?: DeduplicatedSafeguard[]
   duration_milliseconds?: number
+  failure_reason?: string
+  confirmed_by?: number
+  confirmed_at?: string
   determinism_replay_passed?: boolean
 }
 
 export interface CoverageRunInput { scenario_id: number }
+
+export interface EvidencePackState {
+  code: CoverageState
+  label: string
+  readable_summary: string
+  failure_reason?: string
+  confirmed_by?: number
+  confirmed_at?: string
+}
+
+export interface CoverageEvidencePack {
+  pack_version: string
+  exported_at: string
+  evaluation_id: number
+  scenario_id: number
+  algorithm_version: string
+  idempotency_key: string
+  input_hash: string
+  input_snapshot: CoverageSnapshot
+  coverage_score: number
+  score_steps: ScoringStep[]
+  uncovered_paths: PathEvidence[]
+  deduplicated_safeguards: DeduplicatedSafeguard[]
+  risk_rank_before: string
+  risk_rank_after: string
+  state: EvidencePackState
+  evaluated_by: number
+  evaluated_by_name?: string
+  evaluated_at: string
+  duration_milliseconds: number
+  boundary_note: string
+}

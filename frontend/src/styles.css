@@ -178,6 +178,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
 .polling { display: flex; align-items: center; gap: 6px; color: var(--blue); font-size: .68rem; }
 .polling svg { animation: rotate 1.1s linear infinite; }
 @keyframes rotate { to { transform: rotate(360deg); } }
+.state-explanation { margin: 0 0 18px; align-items: flex-start; }
+.state-explanation .el-alert__title { font-size: .74rem; }
+.state-detail { margin: 4px 0 0; font-size: .68rem; line-height: 1.5; }
+.evidence-actions { display: flex; align-items: center; gap: 4px; }
 .coverage-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(310px, .55fr); gap: 30px; margin-top: 18px; }
 .coverage-evidence { padding-left: 24px; border-left: 1px solid var(--line); }
 .path-graph { padding: 17px 0 22px; }

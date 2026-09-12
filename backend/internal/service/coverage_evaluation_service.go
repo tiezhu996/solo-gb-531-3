@@ -1,6 +1,7 @@
 package service
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"gorm.io/gorm"
@@ -22,6 +23,7 @@ type CoverageEvaluationService interface {
 	Void(context.Context, uint, util.Actor) (dto.CoverageEvaluationResponse, error)
 	Replay(context.Context, uint, util.Actor) (dto.CoverageEvaluationResponse, error)
 	Compare(context.Context, uint, uint) (dto.EvaluationComparisonResponse, error)
+	ExportEvidencePack(context.Context, uint) (dto.CoverageEvidencePackResponse, error)
 }
 type coverageEvaluationService struct {
 	evaluations repository.CoverageEvaluationRepository
@@ -367,4 +369,75 @@ func countCovered(paths []dto.CoveragePathResponse) int {
 		}
 	}
 	return count
+}
+
+const evidencePackVersion = "evidence-pack-v1"
+
+func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id uint) (dto.CoverageEvidencePackResponse, error) {
+	evaluation, err := s.evaluations.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return dto.CoverageEvidencePackResponse{}, util.NotFound("coverage evaluation")
+		}
+		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusInternalServerError, util.CodeInternal, "unable to load coverage evaluation for evidence export", err)
+	}
+	response := dto.NewCoverageEvaluationResponse(evaluation)
+	if !json.Valid([]byte(evaluation.InputSnapshot)) {
+		return dto.CoverageEvidencePackResponse{}, util.NewError(http.StatusUnprocessableEntity, util.CodeValidation, "stored input snapshot is unreadable; evidence pack cannot be exported")
+	}
+	var explanation dto.EvaluationExplanation
+	if err := json.Unmarshal([]byte(evaluation.Explanation), &explanation); err != nil {
+		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "stored scoring explanation is unreadable; evidence pack cannot be exported", err)
+	}
+	scoreSteps, uncovered, deduplicated := response.Explanation.ScoreSteps, response.UncoveredPaths, response.DeduplicatedSafeguards
+	if scoreSteps == nil {
+		scoreSteps = []dto.ScoreStepResponse{}
+	}
+	if uncovered == nil {
+		uncovered = []dto.CoveragePathResponse{}
+	}
+	if deduplicated == nil {
+		deduplicated = []dto.DeduplicatedSafeguardResponse{}
+	}
+	return dto.CoverageEvidencePackResponse{
+		PackVersion: evidencePackVersion, ExportedAt: s.now(),
+		EvaluationID: evaluation.ID, ScenarioID: evaluation.ScenarioID,
+		AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
+		InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
+		CoverageScore: evaluation.CoverageScore, ScoreSteps: scoreSteps,
+		UncoveredPaths: uncovered, DeduplicatedSafeguards: deduplicated,
+		RiskRankBefore: evaluation.RiskRankBefore, RiskRankAfter: evaluation.RiskRankAfter,
+		State: evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
+		EvaluatedBy: evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
+		EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
+		BoundaryNote: explanation.BoundaryNote,
+	}, nil
+}
+
+func evidencePackState(state string, failureReason string, confirmedBy *uint, confirmedAt *time.Time) dto.EvidencePackState {
+	info := dto.EvidencePackState{Code: state, Label: state, FailureReason: failureReason, ConfirmedBy: confirmedBy, ConfirmedAt: confirmedAt}
+	switch constants.CoverageState(state) {
+	case constants.CoverageQueued:
+		info.Label, info.ReadableSummary = "Queued", "评估已登记并冻结输入，正在等待计算，尚无评分与路径结论。"
+	case constants.CoverageRunning:
+		info.Label, info.ReadableSummary = "Running", "评估正在计算中，输入已冻结，评分步骤和未覆盖路径尚未落定；请稍后重新导出。"
+	case constants.CoverageCompleted:
+		info.Label = "Completed"
+		info.ReadableSummary = "评估已完成确定性计算，结果等待人工确认；证据包含完整评分步骤、未覆盖路径与独立性去重说明。"
+	case constants.CoverageFailed:
+		info.Label = "Failed"
+		info.ReadableSummary = "评估计算失败，未产生有效覆盖结论；该证据包保留冻结输入、输入哈希与失败原因，评分步骤与未覆盖路径为空，失败评估只能作废、不能确认。"
+		if failureReason == "" {
+			info.ReadableSummary = "评估计算失败，未记录具体失败原因；失败评估只能作废、不能确认。"
+		}
+	case constants.CoverageConfirmed:
+		info.Label = "Confirmed"
+		info.ReadableSummary = "评估结果已由与场景作者不同的复核人确认；确认仅表示完成离线证据复核，不构成操作许可或设备控制指令。"
+	case constants.CoverageVoided:
+		info.Label = "Voided"
+		info.ReadableSummary = "评估已作废，不再作为保护层覆盖依据；冻结输入、历史评分和去重说明仅保留用于审计追溯。"
+	default:
+		info.ReadableSummary = "评估处于未知状态，请联系系统管理员核对状态记录。"
+	}
+	return info
 }

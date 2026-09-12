@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CheckCircle2, FileCheck2, GitCompare, LoaderCircle, Network, Play, RefreshCw, XCircle } from 'lucide-vue-next'
+import { CheckCircle2, Download, FileCheck2, GitCompare, LoaderCircle, Network, Play, RefreshCw, XCircle } from 'lucide-vue-next'
 import AppShell from '../components/common/AppShell.vue'
 import PageHeader from '../components/common/PageHeader.vue'
 import RiskBadge from '../components/common/RiskBadge.vue'
 import ScenarioStateTimeline from '../components/common/ScenarioStateTimeline.vue'
 import EvidenceDrawer from '../components/common/EvidenceDrawer.vue'
 import { useCoverageRun } from '../hooks/useCoverageRun'
+import { useEvidenceExport } from '../hooks/useEvidenceExport'
 import { useAuth } from '../hooks/useAuth'
 import { useCoverageEvaluationStore } from '../stores/coverage-evaluation'
 import { useDeviationScenarioStore } from '../stores/deviation-scenario'
@@ -21,6 +22,7 @@ const scenarios = useDeviationScenarioStore()
 const safeguards = useSafeguardStore()
 const { canEdit, canReview } = useAuth()
 const runner = useCoverageRun()
+const evidenceExport = useEvidenceExport()
 const scenarioId = ref<number>()
 const drawer = ref(false)
 const compareId = ref<number>()
@@ -44,12 +46,24 @@ const scenarioLabel = (id: number) => { const item = scenarios.items.find((x) =>
 async function refresh() { try { await Promise.all([evaluations.load(), scenarios.load(), safeguards.load()]); scenarioId.value ??= scenarios.items[0]?.id } catch (error) { ElMessage.error(errorMessage(error)) } }
 async function run() { if (!scenarioId.value) return ElMessage.warning('请先选择偏差场景'); try { const result = await runner.launch(scenarioId.value); ElMessage.success(result.evaluation_state === 'failed' ? '评估完成但计算失败' : '覆盖评估已生成') } catch (error) { ElMessage.error(errorMessage(error)) } }
 async function changeState(kind: 'confirm' | 'void') { if (!selected.value) return; try { kind === 'confirm' ? await evaluations.confirm(selected.value.id) : await evaluations.voidRun(selected.value.id); ElMessage.success(kind === 'confirm' ? '评估已确认' : '评估已作废') } catch (error) { ElMessage.error(errorMessage(error)) } }
+async function exportPack() {
+  if (!selected.value) return
+  try {
+    await evidenceExport.exportEvidencePack(selected.value.id)
+    ElMessage.success(selected.value.evaluation_state === 'failed' || selected.value.evaluation_state === 'voided'
+      ? '证据包已导出，包含当前状态的可读说明'
+      : '证据包已导出')
+  } catch (error) {
+    ElMessage.error(`证据包导出失败：${errorMessage(error)}`)
+  }
+}
 onMounted(refresh)
 </script>
 
 <template>
   <AppShell>
     <PageHeader eyebrow="DETERMINISTIC COVERAGE REPLAY" title="覆盖推演" description="冻结偏差与保护层输入，构建原因到后果路径，按独立性键去重并保留每一步评分依据。">
+      <el-button :disabled="!selected" :loading="evidenceExport.exporting.value" @click="exportPack"><Download :size="16" />导出证据包</el-button>
       <el-button :loading="evaluations.loading" @click="refresh"><RefreshCw :size="16" />刷新</el-button>
     </PageHeader>
     <section class="run-launcher">
@@ -70,6 +84,18 @@ onMounted(refresh)
         <div><span class="state-label" :class="selected.evaluation_state">{{ coverageStateLabels[selected.evaluation_state] }}</span><small>{{ selected.algorithm_version }}</small></div>
         <div v-if="runner.polling.value" class="polling"><LoaderCircle :size="16" />正在读取计算状态</div>
       </section>
+      <el-alert
+        v-if="['failed', 'voided', 'queued', 'running'].includes(selected.evaluation_state)"
+        :closable="false"
+        :type="selected.evaluation_state === 'failed' ? 'error' : selected.evaluation_state === 'voided' ? 'warning' : 'info'"
+        class="state-explanation"
+      >
+        <template #title>{{ coverageStateLabels[selected.evaluation_state] }} · {{ selected.evaluation_state }}</template>
+        <p class="state-detail">
+          {{ selected.evaluation_state === 'failed' ? '评估计算失败，未产生有效覆盖结论；证据包仍会保留冻结输入、输入哈希与失败原因。' : selected.evaluation_state === 'voided' ? '评估已作废，不再作为保护层覆盖依据；证据包保留历史评分与去重说明，仅用于审计追溯。' : selected.evaluation_state === 'running' ? '评估正在计算中，请稍后重新导出证据包。' : '评估已登记，正在等待计算。' }}
+        </p>
+        <p v-if="selected.failure_reason" class="state-detail"><strong>失败原因：</strong>{{ selected.failure_reason }}</p>
+      </el-alert>
       <ScenarioStateTimeline v-if="scenario" :state="scenario.scenario_state" />
       <div class="coverage-grid">
         <section class="path-workbench">
@@ -84,7 +110,7 @@ onMounted(refresh)
           <ol class="scoring-trace"><li v-for="(step, index) in steps" :key="index"><span>{{ step.step ?? index + 1 }}</span><div><strong>{{ step.rule || step.label }} · {{ step.contribution ?? step.value ?? '-' }}</strong><p>{{ step.explanation || step.detail }}<template v-if="step.running_score !== undefined"> · 累计 {{ step.running_score }}</template></p></div></li></ol>
         </section>
         <aside class="coverage-evidence">
-          <div class="section-heading"><h2>冻结证据</h2><el-tooltip content="查看完整输入快照"><el-button circle text aria-label="查看输入快照" @click="drawer = true"><FileCheck2 :size="17" /></el-button></el-tooltip></div>
+          <div class="section-heading"><h2>冻结证据</h2><div class="evidence-actions"><el-tooltip content="查看完整输入快照"><el-button circle text aria-label="查看输入快照" @click="drawer = true"><FileCheck2 :size="17" /></el-button></el-tooltip><el-tooltip content="导出输入快照、评分步骤、未覆盖路径、去重说明与当前状态"><el-button circle text aria-label="导出证据包" :loading="evidenceExport.exporting.value" @click="exportPack"><Download :size="17" /></el-button></el-tooltip></div></div>
           <dl class="evidence-pairs"><div><dt>场景</dt><dd>{{ scenarioLabel(selected.scenario_id) }}</dd></div><div><dt>保护措施</dt><dd>{{ scenarioSafeguards.length }} 项</dd></div><div><dt>独立性键</dt><dd>{{ new Set(scenarioSafeguards.map((x) => x.independence_key)).size }} 个</dd></div><div><dt>输入哈希</dt><dd><code>{{ selected.input_hash || inputSnapshot.input_hash || '见快照' }}</code></dd></div></dl>
           <div v-if="selected.deduplicated_safeguards?.length" class="dedupe-note"><strong>去重措施</strong><span v-for="item in selected.deduplicated_safeguards" :key="`${item.independence_key}-${item.kept_id}`">{{ item.independence_key }}：保留 #{{ item.kept_id }}，忽略 {{ item.ignored_ids.join(', ') }}</span></div>
           <div class="compare-tools"><GitCompare :size="16" /><el-select v-model="compareId" placeholder="选择版本对比" clearable><el-option v-for="item in comparable" :key="item.id" :label="`#${item.id} · ${item.coverage_score} 分`" :value="item.id" /></el-select></div>

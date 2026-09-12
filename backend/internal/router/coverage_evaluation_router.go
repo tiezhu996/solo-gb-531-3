@@ -17,6 +17,7 @@ func RegisterCoverageEvaluationRoutes(
 	group.GET("", middleware.RequirePermission(constants.PermissionRead), h.List)
 	group.GET("/:id", middleware.RequirePermission(constants.PermissionRead), h.Get)
 	group.GET("/:id/compare/:other_id", middleware.RequirePermission(constants.PermissionRead), h.Compare)
+	group.GET("/:id/evidence-pack", middleware.RequirePermission(constants.PermissionRead), h.ExportEvidencePack)
 	group.POST("", middleware.RequirePermission(constants.PermissionEvaluation), runLimiter.Middleware("coverage-run"), h.Run)
 	group.POST("/:id/confirm", middleware.RequirePermission(constants.PermissionConfirm), h.Confirm)
 	group.POST("/:id/void", middleware.RequirePermission(constants.PermissionConfirm), h.Void)

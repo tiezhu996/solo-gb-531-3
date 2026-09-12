@@ -1,11 +1,12 @@
 package handler
 import (
 	"context"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"hazop-safeguard-coverage/backend/internal/dto"
 	"hazop-safeguard-coverage/backend/internal/service"
 	"hazop-safeguard-coverage/backend/internal/util"
-	"net/http"
 )
 type CoverageEvaluationHandler struct {
 	service service.CoverageEvaluationService
@@ -78,4 +79,13 @@ func (h *CoverageEvaluationHandler) Compare(c *gin.Context) {
 	}
 	result, err := h.service.Compare(c.Request.Context(), id, otherID)
 	respond(c, http.StatusOK, result, err)
+}
+func (h *CoverageEvaluationHandler) ExportEvidencePack(c *gin.Context) {
+	id, err := util.ParseUintParam(c, "id")
+	if err != nil {
+		util.Fail(c, err)
+		return
+	}
+	pack, exportErr := h.service.ExportEvidencePack(c.Request.Context(), id)
+	respond(c, http.StatusOK, pack, exportErr)
 }
