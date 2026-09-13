@@ -198,13 +198,14 @@ func (f *exportFixture) runCompleted(t *testing.T, idempotencyKey string) model.
 }
 
 // insertStateRecord clones a completed evaluation row into another lifecycle state.
+// It deliberately keeps the completed row's score and conclusion columns so tests can
+// prove waiting/failed exports suppress residual conclusions.
 func (f *exportFixture) insertStateRecord(t *testing.T, base model.CoverageEvaluation, key, state string, mutate func(*model.CoverageEvaluation)) model.CoverageEvaluation {
 	t.Helper()
 	clone := base
 	clone.ID = 0
 	clone.IdempotencyKey = key
 	clone.EvaluationState = state
-	clone.CoverageScore = 0
 	if mutate != nil {
 		mutate(&clone)
 	}
@@ -268,21 +269,15 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 
 	completed := f.runCompleted(t, "http-export-completed-01")
 
+	// Waiting rows can hold residual conclusion columns (even malformed ones) from a prior
+	// partial write. Exports must neither parse nor surface them.
 	queued := f.insertStateRecord(t, completed, "http-export-queued-0001", "queued", func(e *model.CoverageEvaluation) {
-		e.UncoveredPaths, e.DeduplicatedSafeguards, e.Explanation = "[]", "[]", "{}"
+		e.UncoveredPaths, e.DeduplicatedSafeguards, e.Explanation = "{broken", "{broken", "{broken"
 	})
-	running := f.insertStateRecord(t, completed, "http-export-running-0001", "running", func(e *model.CoverageEvaluation) {
-		e.UncoveredPaths, e.DeduplicatedSafeguards, e.Explanation = "[]", "[]", "{}"
-	})
-	// A failed row may still carry stale result columns from a prior implementation or a
-	// partial write. The export must suppress every conclusion artifact, not echo them.
+	running := f.insertStateRecord(t, completed, "http-export-running-0001", "running", nil)
+	// A failed row may also carry stale result columns with a positive residual score.
 	failed := f.insertStateRecord(t, completed, "http-export-failed-0001", "failed", func(e *model.CoverageEvaluation) {
-		e.CoverageScore = 70
-		e.RiskRankAfter = "low"
 		e.FailureReason = "simulated algorithm failure: snapshot requires persisted node"
-		if len(e.Explanation) < 10 {
-			t.Fatalf("test setup: failed row must keep the stale explanation column")
-		}
 	})
 	voidedRun := f.runCompleted(t, "http-export-voided-0001")
 	if _, err := f.svc.Void(context.Background(), voidedRun.ID, util.Actor{
@@ -293,24 +288,25 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 	voided, _ := f.evals.GetByID(context.Background(), voidedRun.ID)
 
 	cases := []struct {
-		name             string
-		id               uint
-		state            string
-		label            string
-		summaryKeyword   string
-		failureReason    string
-		wantSteps        int
-		wantUncovered    int
-		wantDeduplicated int
-		wantScore        float64
-		wantRiskAfter    string
-		frozenJSON       string
-		frozenHash       string
+		name                   string
+		id                     uint
+		state                  string
+		label                  string
+		summaryKeyword         string
+		wantConclusionsCleared bool
+		failureReason          string
+		wantSteps              int
+		wantUncovered          int
+		wantDeduplicated       int
+		wantScore              float64
+		wantRiskAfter          string
+		frozenJSON             string
+		frozenHash             string
 	}{
-		{name: "queued", id: queued.ID, state: "queued", label: "Queued", summaryKeyword: "等待计算", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "low", frozenJSON: queued.InputSnapshot, frozenHash: queued.InputHash},
-		{name: "running", id: running.ID, state: "running", label: "Running", summaryKeyword: "计算中", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "low", frozenJSON: running.InputSnapshot, frozenHash: running.InputHash},
+		{name: "queued", id: queued.ID, state: "queued", label: "Queued", summaryKeyword: "等待计算", wantConclusionsCleared: true, wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "", frozenJSON: queued.InputSnapshot, frozenHash: queued.InputHash},
+		{name: "running", id: running.ID, state: "running", label: "Running", summaryKeyword: "计算中", wantConclusionsCleared: true, wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "", frozenJSON: running.InputSnapshot, frozenHash: running.InputHash},
 		{name: "completed", id: completed.ID, state: "completed", label: "Completed", summaryKeyword: "等待人工确认", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, wantScore: 90, wantRiskAfter: "low", frozenJSON: completed.InputSnapshot, frozenHash: completed.InputHash},
-		{name: "failed", id: failed.ID, state: "failed", label: "Failed", summaryKeyword: "计算失败", failureReason: "simulated algorithm failure", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "", frozenJSON: failed.InputSnapshot, frozenHash: failed.InputHash},
+		{name: "failed", id: failed.ID, state: "failed", label: "Failed", summaryKeyword: "计算失败", wantConclusionsCleared: true, failureReason: "simulated algorithm failure", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "", frozenJSON: failed.InputSnapshot, frozenHash: failed.InputHash},
 		{name: "voided", id: voided.ID, state: "voided", label: "Voided", summaryKeyword: "已作废", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, wantScore: 90, wantRiskAfter: "low", frozenJSON: voided.InputSnapshot, frozenHash: voided.InputHash},
 	}
 	for _, tc := range cases {
@@ -355,8 +351,13 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 			if pack.RiskRankAfter != tc.wantRiskAfter {
 				t.Fatalf("risk rank after = %q, want %q", pack.RiskRankAfter, tc.wantRiskAfter)
 			}
-			if tc.state == "failed" && (len(pack.BoundaryNote) == 0 || pack.RiskRankBefore == "") {
-				t.Fatalf("failed pack must keep frozen input metadata (before risk=%q boundary=%q)", pack.RiskRankBefore, pack.BoundaryNote)
+			if tc.wantConclusionsCleared {
+				if !strings.Contains(pack.State.ReadableSummary, "结论字段") {
+					t.Fatalf("%s summary must state conclusion fields are cleared: %q", tc.name, pack.State.ReadableSummary)
+				}
+				if len(pack.BoundaryNote) == 0 || pack.RiskRankBefore == "" {
+					t.Fatalf("%s pack must keep frozen input metadata (before risk=%q boundary=%q)", tc.name, pack.RiskRankBefore, pack.BoundaryNote)
+				}
 			}
 			if pack.InputHash != tc.frozenHash {
 				t.Fatalf("input hash = %q, want frozen %q", pack.InputHash, tc.frozenHash)

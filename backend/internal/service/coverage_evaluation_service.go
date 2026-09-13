@@ -388,25 +388,28 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 	if !json.Valid([]byte(evaluation.InputSnapshot)) {
 		return dto.CoverageEvidencePackResponse{}, util.NewError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: frozen input snapshot is not valid immutable JSON")
 	}
-	failed := evaluation.EvaluationState == string(constants.CoverageFailed)
-	if failed {
-		// A failed evaluation has no valid conclusion. Even when the persisted row still
-		// carries stale scoring steps, uncovered paths or dedup notes, the export must only
-		// present the frozen input, its hash and the failure reason; conclusion fields are
-		// intentionally cleared so they never contradict the failed-state explanation.
-		return dto.CoverageEvidencePackResponse{
-			PackVersion: evidencePackVersion, ExportedAt: s.now(),
-			EvaluationID: evaluation.ID, ScenarioID: evaluation.ScenarioID,
-			AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
-			InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
-			CoverageScore: 0, ScoreSteps: []dto.ScoreStepResponse{},
-			UncoveredPaths: []dto.CoveragePathResponse{}, DeduplicatedSafeguards: []dto.DeduplicatedSafeguardResponse{},
-			RiskRankBefore: evaluation.RiskRankBefore, RiskRankAfter: "",
-			State:       evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
-			EvaluatedBy: evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
-			EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
-			BoundaryNote: algorithm.SafetyBoundary,
-		}, nil
+	base := dto.CoverageEvidencePackResponse{
+		PackVersion: evidencePackVersion, ExportedAt: s.now(),
+		EvaluationID: evaluation.ID, ScenarioID: evaluation.ScenarioID,
+		AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
+		InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
+		RiskRankBefore: evaluation.RiskRankBefore,
+		State:          evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
+		EvaluatedBy:    evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
+		EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
+		BoundaryNote: algorithm.SafetyBoundary,
+	}
+	// Queued, running and failed evaluations have no valid conclusion. Even when the
+	// persisted row still carries stale scoring steps, uncovered paths or dedup notes,
+	// these exports only present the frozen input, its hash and the state explanation;
+	// conclusion columns are neither parsed nor emitted so they cannot contradict the
+	// waiting/failed status. Completed, confirmed and voided exports keep their history.
+	switch constants.CoverageState(evaluation.EvaluationState) {
+	case constants.CoverageQueued, constants.CoverageRunning, constants.CoverageFailed:
+		base.ScoreSteps = []dto.ScoreStepResponse{}
+		base.UncoveredPaths = []dto.CoveragePathResponse{}
+		base.DeduplicatedSafeguards = []dto.DeduplicatedSafeguardResponse{}
+		return base, nil
 	}
 	var explanation dto.EvaluationExplanation
 	if err := json.Unmarshal([]byte(evaluation.Explanation), &explanation); err != nil {
@@ -420,38 +423,31 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 	if err := json.Unmarshal([]byte(evaluation.DeduplicatedSafeguards), &deduplicated); err != nil {
 		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: independence dedup record is not valid JSON", err)
 	}
-	scoreSteps, uncoveredPaths, deduplicatedSafeguards := explanation.ScoreSteps, uncovered, deduplicated
-	if scoreSteps == nil {
-		scoreSteps = []dto.ScoreStepResponse{}
+	if explanation.ScoreSteps == nil {
+		explanation.ScoreSteps = []dto.ScoreStepResponse{}
 	}
-	if uncoveredPaths == nil {
-		uncoveredPaths = []dto.CoveragePathResponse{}
+	if uncovered == nil {
+		uncovered = []dto.CoveragePathResponse{}
 	}
-	if deduplicatedSafeguards == nil {
-		deduplicatedSafeguards = []dto.DeduplicatedSafeguardResponse{}
+	if deduplicated == nil {
+		deduplicated = []dto.DeduplicatedSafeguardResponse{}
 	}
-	return dto.CoverageEvidencePackResponse{
-		PackVersion: evidencePackVersion, ExportedAt: s.now(),
-		EvaluationID: evaluation.ID, ScenarioID: evaluation.ScenarioID,
-		AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
-		InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
-		CoverageScore: evaluation.CoverageScore, ScoreSteps: scoreSteps,
-		UncoveredPaths: uncoveredPaths, DeduplicatedSafeguards: deduplicatedSafeguards,
-		RiskRankBefore: evaluation.RiskRankBefore, RiskRankAfter: evaluation.RiskRankAfter,
-		State:       evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
-		EvaluatedBy: evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
-		EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
-		BoundaryNote: explanation.BoundaryNote,
-	}, nil
+	base.CoverageScore = evaluation.CoverageScore
+	base.ScoreSteps = explanation.ScoreSteps
+	base.UncoveredPaths = uncovered
+	base.DeduplicatedSafeguards = deduplicated
+	base.RiskRankAfter = evaluation.RiskRankAfter
+	base.BoundaryNote = explanation.BoundaryNote
+	return base, nil
 }
 
 func evidencePackState(state string, failureReason string, confirmedBy *uint, confirmedAt *time.Time) dto.EvidencePackState {
 	info := dto.EvidencePackState{Code: state, Label: state, FailureReason: failureReason, ConfirmedBy: confirmedBy, ConfirmedAt: confirmedAt}
 	switch constants.CoverageState(state) {
 	case constants.CoverageQueued:
-		info.Label, info.ReadableSummary = "Queued", "评估已登记并冻结输入，正在等待计算，尚无评分与路径结论。"
+		info.Label, info.ReadableSummary = "Queued", "评估已登记并冻结输入，正在等待计算；证据包仅保留冻结输入、输入哈希与状态说明，评分、未覆盖路径与去重说明等结论字段一律为空。"
 	case constants.CoverageRunning:
-		info.Label, info.ReadableSummary = "Running", "评估正在计算中，输入已冻结，评分步骤和未覆盖路径尚未落定；请稍后重新导出。"
+		info.Label, info.ReadableSummary = "Running", "评估正在计算中，输入已冻结但结论尚未落定；证据包仅保留冻结输入、输入哈希与状态说明，结论字段一律为空，请稍后重新导出。"
 	case constants.CoverageCompleted:
 		info.Label = "Completed"
 		info.ReadableSummary = "评估已完成确定性计算，结果等待人工确认；证据包含完整评分步骤、未覆盖路径与独立性去重说明。"

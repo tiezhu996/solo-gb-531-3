@@ -357,6 +357,64 @@ func TestEvidencePackExportRealServiceRegression(t *testing.T) {
 		t.Fatalf("create residual failed row: %v", err)
 	}
 
+	// Waiting rows may carry the same residual conclusions (and malformed conclusion JSON).
+	queued := model.CoverageEvaluation{
+		ScenarioID: protected.ID, AlgorithmVersion: algorithm.Version,
+		InputSnapshot: completedRow.InputSnapshot, InputHash: completedRow.InputHash,
+		UncoveredPaths: "{broken", DeduplicatedSafeguards: "{broken", Explanation: "{broken",
+		CoverageScore: completedRow.CoverageScore, RiskRankBefore: completedRow.RiskRankBefore,
+		RiskRankAfter: completedRow.RiskRankAfter, EvaluationState: "queued",
+		EvaluatedBy: 7, EvaluatedByName: "engineer", EvaluatedAt: now,
+		CreatedAt: now, UpdatedAt: now, IdempotencyKey: "reg-queued-residual-1",
+	}
+	running := model.CoverageEvaluation{
+		ScenarioID: protected.ID, AlgorithmVersion: algorithm.Version,
+		InputSnapshot: completedRow.InputSnapshot, InputHash: completedRow.InputHash,
+		UncoveredPaths: staleUncovered, DeduplicatedSafeguards: staleDedup, Explanation: staleExplanation,
+		CoverageScore: completedRow.CoverageScore, RiskRankBefore: completedRow.RiskRankBefore,
+		RiskRankAfter: completedRow.RiskRankAfter, EvaluationState: "running",
+		EvaluatedBy: 7, EvaluatedByName: "engineer", EvaluatedAt: now,
+		CreatedAt: now, UpdatedAt: now, IdempotencyKey: "reg-running-residual-1",
+	}
+	for _, waiting := range []*model.CoverageEvaluation{&queued, &running} {
+		if err := evalRepo.Create(ctx, waiting); err != nil {
+			t.Fatalf("create residual %s row: %v", waiting.EvaluationState, err)
+		}
+	}
+
+	assertWaitingPack := func(t *testing.T, id uint, state string) {
+		t.Helper()
+		pack, err := svc.ExportEvidencePack(ctx, id)
+		if err != nil {
+			t.Fatalf("export %s pack: %v", state, err)
+		}
+		if pack.State.Code != state {
+			t.Fatalf("%s state code = %q", state, pack.State.Code)
+		}
+		if string(pack.InputSnapshot) != completedRow.InputSnapshot || pack.InputHash != completedRow.InputHash {
+			t.Fatalf("%s pack must keep frozen input and hash", state)
+		}
+		if !strings.Contains(pack.State.ReadableSummary, "结论字段") {
+			t.Fatalf("%s summary must state conclusion fields are cleared: %q", state, pack.State.ReadableSummary)
+		}
+		if pack.CoverageScore != 0 || pack.RiskRankAfter != "" ||
+			len(pack.ScoreSteps) != 0 || len(pack.UncoveredPaths) != 0 || len(pack.DeduplicatedSafeguards) != 0 {
+			t.Fatalf("%s pack leaked residual conclusions: score=%v riskAfter=%q steps=%d uncovered=%d dedup=%d",
+				state, pack.CoverageScore, pack.RiskRankAfter, len(pack.ScoreSteps), len(pack.UncoveredPaths), len(pack.DeduplicatedSafeguards))
+		}
+		if pack.RiskRankBefore == "" || pack.BoundaryNote == "" {
+			t.Fatalf("%s pack must retain frozen input metadata", state)
+		}
+	}
+
+	t.Run("queued suppresses residual conclusions", func(t *testing.T) {
+		assertWaitingPack(t, queued.ID, "queued")
+	})
+
+	t.Run("running suppresses residual conclusions", func(t *testing.T) {
+		assertWaitingPack(t, running.ID, "running")
+	})
+
 	t.Run("failed suppresses residual conclusions", func(t *testing.T) {
 		pack, err := svc.ExportEvidencePack(ctx, failed.ID)
 		if err != nil {
