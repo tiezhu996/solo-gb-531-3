@@ -274,9 +274,15 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 	running := f.insertStateRecord(t, completed, "http-export-running-0001", "running", func(e *model.CoverageEvaluation) {
 		e.UncoveredPaths, e.DeduplicatedSafeguards, e.Explanation = "[]", "[]", "{}"
 	})
+	// A failed row may still carry stale result columns from a prior implementation or a
+	// partial write. The export must suppress every conclusion artifact, not echo them.
 	failed := f.insertStateRecord(t, completed, "http-export-failed-0001", "failed", func(e *model.CoverageEvaluation) {
-		e.UncoveredPaths, e.DeduplicatedSafeguards, e.Explanation = "[]", "[]", "{}"
+		e.CoverageScore = 70
+		e.RiskRankAfter = "low"
 		e.FailureReason = "simulated algorithm failure: snapshot requires persisted node"
+		if len(e.Explanation) < 10 {
+			t.Fatalf("test setup: failed row must keep the stale explanation column")
+		}
 	})
 	voidedRun := f.runCompleted(t, "http-export-voided-0001")
 	if _, err := f.svc.Void(context.Background(), voidedRun.ID, util.Actor{
@@ -296,14 +302,16 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 		wantSteps        int
 		wantUncovered    int
 		wantDeduplicated int
+		wantScore        float64
+		wantRiskAfter    string
 		frozenJSON       string
 		frozenHash       string
 	}{
-		{name: "queued", id: queued.ID, state: "queued", label: "Queued", summaryKeyword: "等待计算", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, frozenJSON: queued.InputSnapshot, frozenHash: queued.InputHash},
-		{name: "running", id: running.ID, state: "running", label: "Running", summaryKeyword: "计算中", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, frozenJSON: running.InputSnapshot, frozenHash: running.InputHash},
-		{name: "completed", id: completed.ID, state: "completed", label: "Completed", summaryKeyword: "等待人工确认", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, frozenJSON: completed.InputSnapshot, frozenHash: completed.InputHash},
-		{name: "failed", id: failed.ID, state: "failed", label: "Failed", summaryKeyword: "计算失败", failureReason: "simulated algorithm failure", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, frozenJSON: failed.InputSnapshot, frozenHash: failed.InputHash},
-		{name: "voided", id: voided.ID, state: "voided", label: "Voided", summaryKeyword: "已作废", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, frozenJSON: voided.InputSnapshot, frozenHash: voided.InputHash},
+		{name: "queued", id: queued.ID, state: "queued", label: "Queued", summaryKeyword: "等待计算", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "low", frozenJSON: queued.InputSnapshot, frozenHash: queued.InputHash},
+		{name: "running", id: running.ID, state: "running", label: "Running", summaryKeyword: "计算中", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "low", frozenJSON: running.InputSnapshot, frozenHash: running.InputHash},
+		{name: "completed", id: completed.ID, state: "completed", label: "Completed", summaryKeyword: "等待人工确认", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, wantScore: 90, wantRiskAfter: "low", frozenJSON: completed.InputSnapshot, frozenHash: completed.InputHash},
+		{name: "failed", id: failed.ID, state: "failed", label: "Failed", summaryKeyword: "计算失败", failureReason: "simulated algorithm failure", wantSteps: 0, wantUncovered: 0, wantDeduplicated: 0, wantScore: 0, wantRiskAfter: "", frozenJSON: failed.InputSnapshot, frozenHash: failed.InputHash},
+		{name: "voided", id: voided.ID, state: "voided", label: "Voided", summaryKeyword: "已作废", wantSteps: 2, wantUncovered: 0, wantDeduplicated: 1, wantScore: 90, wantRiskAfter: "low", frozenJSON: voided.InputSnapshot, frozenHash: voided.InputHash},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -340,6 +348,15 @@ func TestEvidencePackExportLifecycleStates(t *testing.T) {
 			}
 			if len(pack.DeduplicatedSafeguards) != tc.wantDeduplicated {
 				t.Fatalf("deduplicated safeguards = %d, want %d", len(pack.DeduplicatedSafeguards), tc.wantDeduplicated)
+			}
+			if pack.CoverageScore != tc.wantScore {
+				t.Fatalf("coverage score = %v, want %v", pack.CoverageScore, tc.wantScore)
+			}
+			if pack.RiskRankAfter != tc.wantRiskAfter {
+				t.Fatalf("risk rank after = %q, want %q", pack.RiskRankAfter, tc.wantRiskAfter)
+			}
+			if tc.state == "failed" && (len(pack.BoundaryNote) == 0 || pack.RiskRankBefore == "") {
+				t.Fatalf("failed pack must keep frozen input metadata (before risk=%q boundary=%q)", pack.RiskRankBefore, pack.BoundaryNote)
 			}
 			if pack.InputHash != tc.frozenHash {
 				t.Fatalf("input hash = %q, want frozen %q", pack.InputHash, tc.frozenHash)

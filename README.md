@@ -126,7 +126,7 @@ queued -> running -> completed -> confirmed
 | `POST` | `/api/v1/safeguards/:id/restore` | 恢复有效状态 |
 | `GET/POST` | `/api/v1/coverage-evaluations` | 评估列表与幂等运行 |
 | `GET` | `/api/v1/coverage-evaluations/:id` | 读取不可变评估 |
-| `GET` | `/api/v1/coverage-evaluations/:id/evidence-pack` | 导出证据包：输入快照、评分步骤、未覆盖路径、独立性去重说明与当前状态（失败/作废含可读状态说明） |
+| `GET` | `/api/v1/coverage-evaluations/:id/evidence-pack` | 导出证据包：输入快照、评分步骤、未覆盖路径、独立性去重说明与当前状态（完成/作废保留历史结论；失败包只保留冻结输入、输入哈希与失败原因，结论字段清空；失败/作废附可读状态说明） |
 | `POST` | `/api/v1/coverage-evaluations/:id/replay` | 从快照确定性重放并比较 |
 | `POST` | `/api/v1/coverage-evaluations/:id/confirm` | 人工确认 |
 | `POST` | `/api/v1/coverage-evaluations/:id/void` | 作废评估 |

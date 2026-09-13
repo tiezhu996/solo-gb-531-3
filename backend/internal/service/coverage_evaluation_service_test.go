@@ -147,11 +147,16 @@ func TestExportEvidencePackDescribesFailedEvaluation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
+	// Simulate the defect scenario: a failed row still carries stale, even malformed,
+	// conclusion columns. The failed export path must neither surface them nor fail parsing.
+	staleExplanationJSON := `{broken-json`
+	staleUncovered := `{broken-json`
+	staleDedup := `{broken-json`
 	failed := model.CoverageEvaluation{
 		ScenarioID: scenario.ID, AlgorithmVersion: algorithm.Version,
 		InputSnapshot: snapshotJSON, InputHash: util.HashString(snapshotJSON),
-		UncoveredPaths: "[]", DeduplicatedSafeguards: "[]", Explanation: "{}",
-		RiskRankBefore: "high", RiskRankAfter: "high", EvaluationState: "failed",
+		UncoveredPaths: staleUncovered, DeduplicatedSafeguards: staleDedup, Explanation: staleExplanationJSON,
+		CoverageScore: 70, RiskRankBefore: "high", RiskRankAfter: "low", EvaluationState: "failed",
 		EvaluatedBy: 7, EvaluatedByName: "author", EvaluatedAt: now,
 		CreatedAt: now, UpdatedAt: now, IdempotencyKey: "evidence-key-failed-0001",
 		FailureReason: "simulated determinism failure",
@@ -166,14 +171,21 @@ func TestExportEvidencePackDescribesFailedEvaluation(t *testing.T) {
 	if pack.State.Code != "failed" || pack.State.FailureReason != "simulated determinism failure" {
 		t.Fatalf("failed state detail mismatch: %#v", pack.State)
 	}
-	if pack.State.ReadableSummary == "" {
-		t.Fatal("failed evaluation needs a readable status explanation")
+	if !strings.Contains(pack.State.ReadableSummary, "结论字段") {
+		t.Fatalf("failed summary must state conclusions are cleared, got %q", pack.State.ReadableSummary)
 	}
-	if len(pack.ScoreSteps) != 0 || len(pack.UncoveredPaths) != 0 {
-		t.Fatalf("failed pack must not fabricate scoring results: steps=%d uncovered=%d", len(pack.ScoreSteps), len(pack.UncoveredPaths))
+	if pack.CoverageScore != 0 {
+		t.Fatalf("failed pack coverage score must be 0, got %v", pack.CoverageScore)
 	}
-	if json.Valid(pack.InputSnapshot) == false {
-		t.Fatal("failed pack must still carry the frozen input snapshot")
+	if len(pack.ScoreSteps) != 0 || len(pack.UncoveredPaths) != 0 || len(pack.DeduplicatedSafeguards) != 0 {
+		t.Fatalf("failed pack must suppress stale conclusions: steps=%d uncovered=%d dedup=%d",
+			len(pack.ScoreSteps), len(pack.UncoveredPaths), len(pack.DeduplicatedSafeguards))
+	}
+	if pack.RiskRankAfter != "" {
+		t.Fatalf("failed pack risk rank after must be empty, got %q", pack.RiskRankAfter)
+	}
+	if pack.RiskRankBefore != "high" || !json.Valid(pack.InputSnapshot) || pack.InputHash == "" || pack.BoundaryNote == "" {
+		t.Fatal("failed pack must keep frozen input, hash, before-risk and offline boundary note")
 	}
 }
 
@@ -207,30 +219,33 @@ func TestExportEvidencePackErrors(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-	validBase := func(key string) model.CoverageEvaluation {
+	validBase := func(key, state string) model.CoverageEvaluation {
 		return model.CoverageEvaluation{
 			ScenarioID: scenario.ID, AlgorithmVersion: algorithm.Version,
 			InputSnapshot: `{"algorithm_version":"hazop-cover-v1.0.0"}`, InputHash: "broken",
 			UncoveredPaths: "[]", DeduplicatedSafeguards: "[]", Explanation: "{}",
-			RiskRankBefore: "high", RiskRankAfter: "high", EvaluationState: "failed",
+			RiskRankBefore: "high", RiskRankAfter: "high", EvaluationState: state,
 			EvaluatedBy: 7, EvaluatedByName: "author", EvaluatedAt: now,
 			CreatedAt: now, UpdatedAt: now, IdempotencyKey: key,
 		}
 	}
 	corruptCases := []struct {
 		name      string
+		state     string
 		key       string
 		mutate    func(*model.CoverageEvaluation)
 		wantError string
 	}{
-		{name: "snapshot", key: "evidence-corrupt-snapshot-1", mutate: func(e *model.CoverageEvaluation) { e.InputSnapshot = "{not-json" }, wantError: "frozen input snapshot"},
-		{name: "explanation", key: "evidence-corrupt-explain-01", mutate: func(e *model.CoverageEvaluation) { e.Explanation = "{not-json" }, wantError: "scoring steps explanation"},
-		{name: "uncovered", key: "evidence-corrupt-paths-001", mutate: func(e *model.CoverageEvaluation) { e.UncoveredPaths = "{not-json" }, wantError: "uncovered paths record"},
-		{name: "dedup", key: "evidence-corrupt-dedup-001", mutate: func(e *model.CoverageEvaluation) { e.DeduplicatedSafeguards = "{not-json" }, wantError: "independence dedup record"},
+		// Failed packs still export the frozen input, so a corrupt snapshot must be rejected.
+		{name: "snapshot", state: "failed", key: "evidence-corrupt-snapshot-1", mutate: func(e *model.CoverageEvaluation) { e.InputSnapshot = "{not-json" }, wantError: "frozen input snapshot"},
+		// Conclusion columns are only parsed for non-failed states; completed export must name the broken artifact.
+		{name: "explanation", state: "completed", key: "evidence-corrupt-explain-01", mutate: func(e *model.CoverageEvaluation) { e.Explanation = "{not-json" }, wantError: "scoring steps explanation"},
+		{name: "uncovered", state: "completed", key: "evidence-corrupt-paths-001", mutate: func(e *model.CoverageEvaluation) { e.UncoveredPaths = "{not-json" }, wantError: "uncovered paths record"},
+		{name: "dedup", state: "completed", key: "evidence-corrupt-dedup-001", mutate: func(e *model.CoverageEvaluation) { e.DeduplicatedSafeguards = "{not-json" }, wantError: "independence dedup record"},
 	}
 	for _, tc := range corruptCases {
 		t.Run(tc.name, func(t *testing.T) {
-			evaluation := validBase(tc.key)
+			evaluation := validBase(tc.key, tc.state)
 			tc.mutate(&evaluation)
 			if err := repo.Create(context.Background(), &evaluation); err != nil {
 				t.Fatalf("create corrupt evaluation: %v", err)

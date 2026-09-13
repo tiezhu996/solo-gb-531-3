@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 )
+
 type CoverageEvaluationService interface {
 	Run(context.Context, dto.RunCoverageEvaluationRequest, string, util.Actor) (dto.CoverageEvaluationResponse, bool, error)
 	Get(context.Context, uint) (dto.CoverageEvaluationResponse, error)
@@ -34,6 +36,7 @@ type coverageEvaluationService struct {
 	evaluator   *algorithm.Evaluator
 	now         func() time.Time
 }
+
 func NewCoverageEvaluationService(
 	evaluations repository.CoverageEvaluationRepository,
 	scenarios repository.DeviationScenarioRepository,
@@ -385,6 +388,26 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 	if !json.Valid([]byte(evaluation.InputSnapshot)) {
 		return dto.CoverageEvidencePackResponse{}, util.NewError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: frozen input snapshot is not valid immutable JSON")
 	}
+	failed := evaluation.EvaluationState == string(constants.CoverageFailed)
+	if failed {
+		// A failed evaluation has no valid conclusion. Even when the persisted row still
+		// carries stale scoring steps, uncovered paths or dedup notes, the export must only
+		// present the frozen input, its hash and the failure reason; conclusion fields are
+		// intentionally cleared so they never contradict the failed-state explanation.
+		return dto.CoverageEvidencePackResponse{
+			PackVersion: evidencePackVersion, ExportedAt: s.now(),
+			EvaluationID: evaluation.ID, ScenarioID: evaluation.ScenarioID,
+			AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
+			InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
+			CoverageScore: 0, ScoreSteps: []dto.ScoreStepResponse{},
+			UncoveredPaths: []dto.CoveragePathResponse{}, DeduplicatedSafeguards: []dto.DeduplicatedSafeguardResponse{},
+			RiskRankBefore: evaluation.RiskRankBefore, RiskRankAfter: "",
+			State:       evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
+			EvaluatedBy: evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
+			EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
+			BoundaryNote: algorithm.SafetyBoundary,
+		}, nil
+	}
 	var explanation dto.EvaluationExplanation
 	if err := json.Unmarshal([]byte(evaluation.Explanation), &explanation); err != nil {
 		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: scoring steps explanation is not valid JSON", err)
@@ -397,7 +420,7 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 	if err := json.Unmarshal([]byte(evaluation.DeduplicatedSafeguards), &deduplicated); err != nil {
 		return dto.CoverageEvidencePackResponse{}, util.WrapError(http.StatusUnprocessableEntity, util.CodeValidation, "evidence pack rejected: independence dedup record is not valid JSON", err)
 	}
-	scoreSteps, uncoveredPaths, deduplicatedSafeguards := response.Explanation.ScoreSteps, response.UncoveredPaths, response.DeduplicatedSafeguards
+	scoreSteps, uncoveredPaths, deduplicatedSafeguards := explanation.ScoreSteps, uncovered, deduplicated
 	if scoreSteps == nil {
 		scoreSteps = []dto.ScoreStepResponse{}
 	}
@@ -413,9 +436,9 @@ func (s *coverageEvaluationService) ExportEvidencePack(ctx context.Context, id u
 		AlgorithmVersion: evaluation.AlgorithmVersion, IdempotencyKey: evaluation.IdempotencyKey,
 		InputHash: evaluation.InputHash, InputSnapshot: response.InputSnapshot,
 		CoverageScore: evaluation.CoverageScore, ScoreSteps: scoreSteps,
-		UncoveredPaths: uncovered, DeduplicatedSafeguards: deduplicated,
+		UncoveredPaths: uncoveredPaths, DeduplicatedSafeguards: deduplicatedSafeguards,
 		RiskRankBefore: evaluation.RiskRankBefore, RiskRankAfter: evaluation.RiskRankAfter,
-		State: evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
+		State:       evidencePackState(evaluation.EvaluationState, evaluation.FailureReason, evaluation.ConfirmedBy, evaluation.ConfirmedAt),
 		EvaluatedBy: evaluation.EvaluatedBy, EvaluatedByName: evaluation.EvaluatedByName,
 		EvaluatedAt: evaluation.EvaluatedAt, DurationMilliseconds: evaluation.DurationMilliseconds,
 		BoundaryNote: explanation.BoundaryNote,
@@ -434,9 +457,9 @@ func evidencePackState(state string, failureReason string, confirmedBy *uint, co
 		info.ReadableSummary = "评估已完成确定性计算，结果等待人工确认；证据包含完整评分步骤、未覆盖路径与独立性去重说明。"
 	case constants.CoverageFailed:
 		info.Label = "Failed"
-		info.ReadableSummary = "评估计算失败，未产生有效覆盖结论；该证据包保留冻结输入、输入哈希与失败原因，评分步骤与未覆盖路径为空，失败评估只能作废、不能确认。"
+		info.ReadableSummary = "评估计算失败，未产生有效覆盖结论；证据包仅保留冻结输入、输入哈希与失败原因，评分步骤、未覆盖路径、去重说明与评估后风险等结论字段一律为空，失败评估只能作废、不能确认。"
 		if failureReason == "" {
-			info.ReadableSummary = "评估计算失败，未记录具体失败原因；失败评估只能作废、不能确认。"
+			info.ReadableSummary = "评估计算失败且未记录具体失败原因；证据包仅保留冻结输入与输入哈希，结论字段一律为空，失败评估只能作废、不能确认。"
 		}
 	case constants.CoverageConfirmed:
 		info.Label = "Confirmed"
