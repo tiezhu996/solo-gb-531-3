@@ -258,3 +258,205 @@ func TestExportEvidencePackErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestEvidencePackExportRealServiceRegression drives the real Run algorithm to produce
+// genuine scoring steps, uncovered paths and dedup notes, then verifies that a failed
+// record carrying those residual conclusions exports only the frozen input, hash and
+// failure reason. It also regresses completed, voided and corrupt-snapshot exports.
+func TestEvidencePackExportRealServiceRegression(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	nodeRepo := repository.NewProcessNodeRepository(db)
+	scenarioRepo := repository.NewDeviationScenarioRepository(db)
+	safeguardRepo := repository.NewSafeguardRepository(db)
+	evalRepo := repository.NewCoverageEvaluationRepository(db)
+	auditRepo := repository.NewAuditRepository(db)
+	svc := NewCoverageEvaluationService(evalRepo, scenarioRepo, nodeRepo, safeguardRepo, auditRepo, algorithm.NewEvaluator())
+
+	now := time.Now().UTC()
+	node := model.ProcessNode{
+		NodeCode: "R-910", Name: "Regression Reactor", UnitName: "Regression Unit", Medium: "propylene",
+		DesignPressure: 3, DesignTemperature: 210, OwnerTeam: "pss", Status: "active",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := nodeRepo.Create(ctx, &node); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	// Scenario A has two safeguards sharing one independence key: yields real score steps + dedup.
+	protected := model.DeviationScenario{
+		ProcessNodeID: node.ID, Guideword: "more", Parameter: "temperature",
+		Cause: "cooling loss", Consequence: "overpressure", Likelihood: 4, Severity: 5,
+		ScenarioState: "analyzed", Version: 1, CreatedBy: 7, CreatedByName: "engineer", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := scenarioRepo.Create(ctx, &protected); err != nil {
+		t.Fatalf("create protected scenario: %v", err)
+	}
+	verified := now.AddDate(0, 0, -5)
+	for _, item := range []model.Safeguard{
+		{Name: "SIS trip A", SafeguardType: "sis", TargetScenarioID: protected.ID, IndependenceKey: "SIS-910", Effectiveness: 0.9, TestIntervalDays: 365, LastVerifiedAt: &verified, LifecycleState: "active", EvidenceNote: "a", CreatedAt: now, UpdatedAt: now},
+		{Name: "SIS trip duplicate", SafeguardType: "sis", TargetScenarioID: protected.ID, IndependenceKey: "SIS-910", Effectiveness: 0.6, TestIntervalDays: 365, LastVerifiedAt: &verified, LifecycleState: "active", EvidenceNote: "b", CreatedAt: now, UpdatedAt: now},
+	} {
+		guard := item
+		if err := safeguardRepo.Create(ctx, &guard); err != nil {
+			t.Fatalf("create safeguard: %v", err)
+		}
+	}
+	// Scenario B has no safeguards: yields a real uncovered path and zero coverage.
+	unprotected := model.DeviationScenario{
+		ProcessNodeID: node.ID, Guideword: "less", Parameter: "flow",
+		Cause: "pump trip", Consequence: "dry run", Likelihood: 3, Severity: 4,
+		ScenarioState: "analyzed", Version: 1, CreatedBy: 7, CreatedByName: "engineer", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := scenarioRepo.Create(ctx, &unprotected); err != nil {
+		t.Fatalf("create unprotected scenario: %v", err)
+	}
+
+	author := util.Actor{UserID: 7, Username: "engineer", Role: "process_engineer", RequestID: "reg-run-protected"}
+	completed, duplicate, err := svc.Run(ctx, dto.RunCoverageEvaluationRequest{ScenarioID: protected.ID}, "reg-completed-0001", author)
+	if err != nil || duplicate || completed.EvaluationState != "completed" {
+		t.Fatalf("protected run: state=%s duplicate=%t err=%v", completed.EvaluationState, duplicate, err)
+	}
+	_, _, err = svc.Run(ctx, dto.RunCoverageEvaluationRequest{ScenarioID: unprotected.ID}, "reg-uncovered-0001",
+		util.Actor{UserID: 7, Username: "engineer", Role: "process_engineer", RequestID: "reg-run-uncovered"})
+	if err != nil {
+		t.Fatalf("unprotected run: %v", err)
+	}
+	completedRow, err := evalRepo.FindByIdempotencyKey(ctx, "reg-completed-0001")
+	if err != nil {
+		t.Fatalf("load completed row: %v", err)
+	}
+	uncoveredRow, err := evalRepo.FindByIdempotencyKey(ctx, "reg-uncovered-0001")
+	if err != nil {
+		t.Fatalf("load uncovered row: %v", err)
+	}
+	// The real algorithm must have populated all three conclusion artifacts across the runs.
+	if len(completed.Explanation.ScoreSteps) == 0 || len(completed.DeduplicatedSafeguards) == 0 {
+		t.Fatalf("protected run must yield real steps/dedup: steps=%d dedup=%d",
+			len(completed.Explanation.ScoreSteps), len(completed.DeduplicatedSafeguards))
+	}
+	if len(uncoveredRow.UncoveredPaths) <= len("[]") {
+		t.Fatalf("unprotected run must persist a real uncovered path: %s", uncoveredRow.UncoveredPaths)
+	}
+
+	// Build a failed row whose residual conclusion columns merge the genuine protected and
+	// unprotected artifacts, plus a positive stale score and residual risk.
+	staleUncovered := uncoveredRow.UncoveredPaths
+	staleDedup := completedRow.DeduplicatedSafeguards
+	staleExplanation := completedRow.Explanation
+	failed := model.CoverageEvaluation{
+		ScenarioID: protected.ID, AlgorithmVersion: algorithm.Version,
+		InputSnapshot: completedRow.InputSnapshot, InputHash: completedRow.InputHash,
+		UncoveredPaths: staleUncovered, DeduplicatedSafeguards: staleDedup, Explanation: staleExplanation,
+		CoverageScore: completedRow.CoverageScore, RiskRankBefore: completedRow.RiskRankBefore,
+		RiskRankAfter: completedRow.RiskRankAfter, EvaluationState: "failed",
+		EvaluatedBy: 7, EvaluatedByName: "engineer", EvaluatedAt: now,
+		CreatedAt: now, UpdatedAt: now, IdempotencyKey: "reg-failed-residual-1",
+		FailureReason: "residual failure: deterministic check failed after partial write",
+	}
+	if err := evalRepo.Create(ctx, &failed); err != nil {
+		t.Fatalf("create residual failed row: %v", err)
+	}
+
+	t.Run("failed suppresses residual conclusions", func(t *testing.T) {
+		pack, err := svc.ExportEvidencePack(ctx, failed.ID)
+		if err != nil {
+			t.Fatalf("export failed pack: %v", err)
+		}
+		// Frozen input, hash and failure reason survive.
+		if string(pack.InputSnapshot) != completedRow.InputSnapshot {
+			t.Fatal("failed pack must keep the frozen input snapshot byte-for-byte")
+		}
+		if pack.InputHash != completedRow.InputHash {
+			t.Fatalf("failed pack must keep input hash %q, got %q", completedRow.InputHash, pack.InputHash)
+		}
+		if pack.State.Code != "failed" || pack.State.FailureReason != failed.FailureReason {
+			t.Fatalf("failed state must carry failure reason: %#v", pack.State)
+		}
+		// Every conclusion artifact is cleared even though the row held real results.
+		if pack.CoverageScore != 0 {
+			t.Fatalf("failed pack score must be 0, got %v", pack.CoverageScore)
+		}
+		if len(pack.ScoreSteps) != 0 {
+			t.Fatalf("failed pack must clear %d residual score steps", len(pack.ScoreSteps))
+		}
+		if len(pack.UncoveredPaths) != 0 {
+			t.Fatalf("failed pack must clear %d residual uncovered paths", len(pack.UncoveredPaths))
+		}
+		if len(pack.DeduplicatedSafeguards) != 0 {
+			t.Fatalf("failed pack must clear %d residual dedup notes", len(pack.DeduplicatedSafeguards))
+		}
+		if pack.RiskRankAfter != "" {
+			t.Fatalf("failed pack must clear residual risk rank, got %q", pack.RiskRankAfter)
+		}
+		if !strings.Contains(pack.State.ReadableSummary, "结论字段") {
+			t.Fatalf("failed summary must explain conclusions are cleared: %q", pack.State.ReadableSummary)
+		}
+		// Input-side metadata is still evidence.
+		if pack.RiskRankBefore == "" || pack.BoundaryNote == "" || pack.AlgorithmVersion == "" {
+			t.Fatal("failed pack must retain before-risk, boundary note and algorithm version")
+		}
+		// Repeatable: a second export produces the same frozen input and cleared conclusions.
+		again, err := svc.ExportEvidencePack(ctx, failed.ID)
+		if err != nil {
+			t.Fatalf("repeat export: %v", err)
+		}
+		if string(again.InputSnapshot) != string(pack.InputSnapshot) || again.InputHash != pack.InputHash ||
+			len(again.ScoreSteps) != 0 || len(again.UncoveredPaths) != 0 || len(again.DeduplicatedSafeguards) != 0 ||
+			again.CoverageScore != 0 || again.RiskRankAfter != "" {
+			t.Fatal("repeated failed export is inconsistent")
+		}
+	})
+
+	t.Run("completed keeps real conclusions", func(t *testing.T) {
+		pack, err := svc.ExportEvidencePack(ctx, completedRow.ID)
+		if err != nil {
+			t.Fatalf("export completed pack: %v", err)
+		}
+		if pack.State.Code != "completed" || pack.CoverageScore != completedRow.CoverageScore {
+			t.Fatalf("completed pack must keep score %v, got %v state=%s",
+				completedRow.CoverageScore, pack.CoverageScore, pack.State.Code)
+		}
+		if len(pack.ScoreSteps) == 0 || len(pack.DeduplicatedSafeguards) == 0 {
+			t.Fatalf("completed pack must keep real steps and dedup: steps=%d dedup=%d",
+				len(pack.ScoreSteps), len(pack.DeduplicatedSafeguards))
+		}
+		if pack.RiskRankAfter == "" || string(pack.InputSnapshot) != completedRow.InputSnapshot {
+			t.Fatal("completed pack must keep residual risk and frozen snapshot")
+		}
+	})
+
+	t.Run("voided keeps historical conclusions", func(t *testing.T) {
+		reviewer := util.Actor{UserID: 20, Username: "reviewer", Role: "safety_reviewer", RequestID: "reg-void"}
+		voided, err := svc.Void(ctx, completedRow.ID, reviewer)
+		if err != nil || voided.EvaluationState != "voided" {
+			t.Fatalf("void: state=%s err=%v", voided.EvaluationState, err)
+		}
+		pack, err := svc.ExportEvidencePack(ctx, completedRow.ID)
+		if err != nil {
+			t.Fatalf("export voided pack: %v", err)
+		}
+		if pack.State.Code != "voided" {
+			t.Fatalf("state = %s, want voided", pack.State.Code)
+		}
+		if len(pack.ScoreSteps) == 0 || len(pack.DeduplicatedSafeguards) == 0 || pack.CoverageScore == 0 {
+			t.Fatalf("voided pack must retain historical conclusions: steps=%d dedup=%d score=%v",
+				len(pack.ScoreSteps), len(pack.DeduplicatedSafeguards), pack.CoverageScore)
+		}
+	})
+
+	t.Run("corrupt snapshot names the broken business artifact", func(t *testing.T) {
+		corrupt := failed
+		corrupt.ID = 0
+		corrupt.IdempotencyKey = "reg-failed-corrupt-01"
+		corrupt.InputSnapshot = "{broken-json"
+		if err := evalRepo.Create(ctx, &corrupt); err != nil {
+			t.Fatalf("create corrupt failed row: %v", err)
+		}
+		_, err := svc.ExportEvidencePack(ctx, corrupt.ID)
+		var appErr *util.AppError
+		if !errors.As(err, &appErr) || appErr.Status != 422 ||
+			appErr.Code != util.CodeValidation || !strings.Contains(appErr.Message, "frozen input snapshot") {
+			t.Fatalf("corrupt snapshot must return 422 naming the frozen input snapshot rule, got %v", err)
+		}
+	})
+}
